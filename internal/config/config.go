@@ -65,6 +65,8 @@ type Config struct {
 	Models []string `yaml:"models"`
 	// InferConfigs allows defining multiple inference configurations
 	InferConfigs []map[string]interface{} `yaml:"inference_configs"`
+	// Concurrency defines how many backend URLs to process in parallel
+	Concurrency int `yaml:"concurrency"`
 }
 
 // DefaultConfig returns the default configuration.
@@ -86,6 +88,7 @@ func DefaultConfig() *Config {
 			{"num_ctx": 2048},
 			{"num_ctx": 4096},
 		},
+		Concurrency: 1,
 	}
 }
 

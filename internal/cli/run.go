@@ -48,11 +48,12 @@ import (
 )
 
 var (
-	urlsOverride    []string
-	outputOverride  string
-	promptFile      string
-	excludeOverride []string
-	modelsOverride  []string
+	urlsOverride        []string
+	outputOverride      string
+	promptFile          string
+	excludeOverride     []string
+	modelsOverride      []string
+	concurrencyOverride int
 )
 
 var runCmd = &cobra.Command{
@@ -65,21 +66,21 @@ The process follows a strict protocol:
 3. Benchmarking: Executes multiple inference configurations to collect performance metrics.
 
 Results are automatically saved to CSV and JSON formats, with automatic file versioning
-(e.g., results.json.1) to prevent overwriting previous data.`,
+(e.g., results.json.1) to prevent overwriting previous data.
+
+Concurrency is handled at the BACKEND level. Each URL is processed by a dedicated worker.
+To maintain benchmark integrity, models within a single backend are tested sequentially.`,
 	Example: `  # Run with defaults (uses forest_runner.yaml)
   forest-runner run
 
   # Override target URLs and output directory
   forest-runner run --urls http://ollama-1:11434,http://ollama-2:11434 -o ./benchmarks
 
+  # Run with parallel backend workers (default concurrency is 1)
+  forest-runner run --urls http://ollama-1:11434,http://ollama-2:11434 --concurrency 2
+
   # Run only specific models
-  forest-runner run --models qwen2.5:7b,llama3.1:8b
-
-  # Exclude specific models (e.g., vision models)
-  forest-runner run --exclude vision,moe
-
-  # Use a specific prompt file
-  forest-runner run -p ./prompts/code_gen.md`,
+  forest-runner run --models qwen2.5:7b,llama3.1:8b`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// 1. Load Config
 		cfg, err := config.Load(cfgFile)
@@ -109,6 +110,9 @@ Results are automatically saved to CSV and JSON formats, with automatic file ver
 		if len(modelsOverride) > 0 {
 			cfg.Models = modelsOverride
 		}
+		if cmd.Flags().Changed("concurrency") {
+			cfg.Concurrency = concurrencyOverride
+		}
 
 		// 3. Execution
 		return engine.Run(cfg)
@@ -123,4 +127,5 @@ func init() {
 	runCmd.Flags().StringVarP(&promptFile, "prompt-file", "p", "", "Path to a markdown/text file containing the prompt (overrides config)")
 	runCmd.Flags().StringSliceVar(&excludeOverride, "exclude", nil, "Comma-separated list of substrings to exclude from model names")
 	runCmd.Flags().StringSliceVar(&modelsOverride, "models", nil, "Comma-separated list of specific models to run (skips discovery)")
+	runCmd.Flags().IntVarP(&concurrencyOverride, "concurrency", "c", 0, "Number of backend URLs to process in parallel")
 }

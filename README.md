@@ -60,6 +60,9 @@ gpu_only: true           # If true, abort if model spills into System RAM (CPU)
 cpu_only_allowed: false  # If false, abort if model loads 100% on CPU
 keep_alive: 0            # "0" (immediate unload), "5m", "1h", etc.
 
+# Backend Concurrency (Fleet Auditing)
+concurrency: 1           # Number of backend URLs to process in parallel
+
 exclude:
   - "embed"
   - "rerank"
