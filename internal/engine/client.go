@@ -70,10 +70,20 @@ type Engine struct {
 
 // New creates a new Engine.
 func New(cfg *config.Config) *Engine {
+	// Cruiser Note: We use a custom transport to differentiate between
+	// connection timeout and the server hanging during headers (e.g., model loading).
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	// ResponseHeaderTimeout covers the time until we receive the first response byte
+	// (Step 3: Headers). This is where model loading happens.
+	transport.ResponseHeaderTimeout = cfg.LoadTimeout
+
 	return &Engine{
 		Config: cfg,
 		Client: &http.Client{
-			Timeout: cfg.StreamTimeout + 10*time.Second, // Safety buffer
+			Transport: transport,
+			// The overall timeout must cover Loading + Generation
+			Timeout: cfg.LoadTimeout + (cfg.StreamTimeout * 2),
 		},
 	}
 }
@@ -141,12 +151,58 @@ func (e *Engine) GetRunningModelInfo(baseURL, modelName string) (int64, int64, e
 	return 0, 0, nil // Not found (might have unloaded?)
 }
 
+// monitorLoading polls /api/ps during the loading phase to ensure model placement
+// adheres to the configured GPU/CPU guards.
+func (e *Engine) monitorLoading(ctx context.Context, baseURL, modelName string, abort chan<- error, cancel context.CancelFunc) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			size, sizeVRAM, err := e.GetRunningModelInfo(baseURL, modelName)
+			if err != nil {
+				// Don't fail the monitor just because ps failed once (race condition during load)
+				continue
+			}
+
+			// Model not found yet or just started loading
+			if size == 0 {
+				continue
+			}
+
+			// 100% CPU Check
+			if sizeVRAM == 0 && !e.Config.CPUOnlyAllowed {
+				select {
+				case abort <- fmt.Errorf("ABORT: Model loaded 100%% on CPU (cpu_only_allowed=false)"):
+					cancel()
+				default:
+				}
+				return
+			}
+
+			// Split Load Check (any part on CPU)
+			if sizeVRAM < size && e.Config.GPUOnly {
+				select {
+				case abort <- fmt.Errorf("ABORT: Model is partially on CPU (gpu_only=true)"):
+					cancel()
+				default:
+				}
+				return
+			}
+		}
+	}
+}
+
 // StreamInference runs a streaming inference request.
 func (e *Engine) StreamInference(baseURL, modelName, prompt string) error {
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":  modelName,
-		"prompt": prompt,
-		"stream": true,
+		"model":      modelName,
+		"prompt":     prompt,
+		"stream":     true,
+		"keep_alive": e.Config.KeepAlive,
 	})
 
 	// Setup Trace
@@ -155,15 +211,24 @@ func (e *Engine) StreamInference(baseURL, modelName, prompt string) error {
 			output.Logger.Info("Network: Connected", "remote", connInfo.Conn.RemoteAddr(), "reused", connInfo.Reused)
 		},
 		WroteRequest: func(w httptrace.WroteRequestInfo) {
-			output.Logger.Info("Network: Request Sent. Waiting for server...", "model", modelName)
+			output.Logger.Info("Network: Request Sent. Waiting for model to load...", "model", modelName)
 		},
 		GotFirstResponseByte: func() {
 			output.Logger.Info("Network: First Byte Received", "model", modelName)
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), e.Config.StreamTimeout)
+	// The context timeout must cover both the Load phase and the Generation phase.
+	ctx, cancel := context.WithCancel(context.Background())
+	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, e.Config.LoadTimeout+e.Config.StreamTimeout)
 	defer cancel()
+	defer timeoutCancel()
+
+	ctx = timeoutCtx // Use the timeout-wrapped context
+
+	// Launch Loading Monitor
+	abort := make(chan error, 1)
+	go e.monitorLoading(ctx, baseURL, modelName, abort, cancel)
 
 	ctx = httptrace.WithClientTrace(ctx, trace)
 
@@ -173,13 +238,16 @@ func (e *Engine) StreamInference(baseURL, modelName, prompt string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Retry loop? The Python script did retries. Let's do it here.
-	// Actually, let's keep this function simple: "Try once". The caller (Runner) can loop retries if desired,
-	// OR we implement retry here. The logic in Python was: retry inside function.
-
-	// Refactoring: Let's do a simple retry wrapper or loop here.
+	// Retry loop
 	var lastErr error
 	for i := 0; i < e.Config.MaxRetries; i++ {
+		// Check for specific abort error before retrying
+		select {
+		case err := <-abort:
+			return err
+		default:
+		}
+
 		if i > 0 {
 			time.Sleep(e.Config.RetryDelay)
 			output.Logger.Info("Retrying streaming...", "attempt", i+1)
@@ -190,7 +258,18 @@ func (e *Engine) StreamInference(baseURL, modelName, prompt string) error {
 
 		resp, err := e.Client.Do(req)
 		if err != nil {
-			lastErr = err
+			// Check for specific abort error before classifying as network error
+			select {
+			case abortErr := <-abort:
+				return abortErr
+			default:
+			}
+
+			if strings.Contains(err.Error(), "awaiting headers") {
+				lastErr = fmt.Errorf("Ollama Header Timeout (model loading?): %w", err)
+			} else {
+				lastErr = fmt.Errorf("Network/Connection Error: %w", err)
+			}
 			continue
 		}
 
@@ -201,7 +280,7 @@ func (e *Engine) StreamInference(baseURL, modelName, prompt string) error {
 		if success {
 			return nil
 		}
-		lastErr = fmt.Errorf("stream incomplete")
+		lastErr = fmt.Errorf("stream incomplete or failed to start")
 	}
 
 	return lastErr
@@ -251,13 +330,11 @@ func (e *Engine) Inference(baseURL, modelName, prompt string, extraConfig map[st
 	start := time.Now()
 
 	payload := map[string]interface{}{
-		"model":  modelName,
-		"prompt": prompt,
-		"stream": false,
-	}
-	// Merge extra config
-	for k, v := range extraConfig {
-		payload[k] = v
+		"model":      modelName,
+		"prompt":     prompt,
+		"stream":     false,
+		"options":    extraConfig,
+		"keep_alive": e.Config.KeepAlive,
 	}
 
 	reqBody, _ := json.Marshal(payload)
@@ -274,52 +351,100 @@ func (e *Engine) Inference(baseURL, modelName, prompt string, extraConfig map[st
 	for i := 0; i < e.Config.MaxRetries; i++ {
 		if i > 0 {
 			time.Sleep(e.Config.RetryDelay)
+			output.Logger.Info("Retrying inference...", "attempt", i+1)
 		}
 
-		resp, err := e.Client.Post(fmt.Sprintf("%s/api/generate", baseURL), "application/json", bytes.NewBuffer(reqBody))
-		if err != nil {
-			lastErr = err
-			continue
+		finished, resData, abortErr, loopErr := func() (bool, model.Result, error, error) {
+			ctx, cancel := context.WithCancel(context.Background())
+			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, e.Config.LoadTimeout+e.Config.StreamTimeout)
+			defer timeoutCancel()
+			defer cancel()
+
+			// Launch Loading Monitor
+			abort := make(chan error, 1)
+			go e.monitorLoading(timeoutCtx, baseURL, modelName, abort, cancel)
+
+			req, err := http.NewRequestWithContext(timeoutCtx, "POST", fmt.Sprintf("%s/api/generate", baseURL), bytes.NewBuffer(reqBody))
+			if err != nil {
+				return false, model.Result{}, nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			output.Logger.Info("Network: Request Sent. Waiting for model to load...", "model", modelName)
+			resp, err := e.Client.Do(req)
+			if err != nil {
+				// Check for specific abort error before classifying as network error
+				select {
+				case abortErr := <-abort:
+					return false, model.Result{}, abortErr, nil
+				default:
+				}
+
+				// Cruiser Protocol: Classify specific network errors
+				message := err.Error()
+				if strings.Contains(message, "awaiting headers") {
+					return false, model.Result{}, nil, fmt.Errorf("Ollama Header Timeout (model loading?): %w", err)
+				}
+				return false, model.Result{}, nil, fmt.Errorf("Network/Connection Error: %w", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				return false, model.Result{}, nil, fmt.Errorf("Ollama Server Error (%s): %s", resp.Status, string(body))
+			}
+
+			var data struct {
+				Response           string `json:"response"`
+				Done               bool   `json:"done"`
+				TotalDuration      int64  `json:"total_duration"` // ns
+				LoadDuration       int64  `json:"load_duration"`  // ns
+				PromptEvalCount    int    `json:"prompt_eval_count"`
+				PromptEvalDuration int64  `json:"prompt_eval_duration"` // ns
+				EvalCount          int    `json:"eval_count"`
+				EvalDuration       int64  `json:"eval_duration"` // ns
+				Error              string `json:"error"`         // API-side error
+			}
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return false, model.Result{}, nil, fmt.Errorf("failed to read response body: %w", err)
+			}
+
+			if err := json.Unmarshal(bodyBytes, &data); err != nil {
+				return false, model.Result{}, nil, fmt.Errorf("Ollama returned invalid JSON: %w (Body: %s)", err, string(bodyBytes))
+			}
+
+			if data.Error != "" {
+				return false, model.Result{}, nil, fmt.Errorf("Ollama API Error: %s", data.Error)
+			}
+
+			// Success
+			return true, model.Result{
+				Model:              modelName,
+				URL:                baseURL,
+				Config:             extraConfig,
+				Timestamp:          start,
+				Response:           data.Response,
+				TotalDuration:      time.Duration(data.TotalDuration),
+				LoadDuration:       time.Duration(data.LoadDuration),
+				PromptEvalCount:    data.PromptEvalCount,
+				PromptEvalDuration: time.Duration(data.PromptEvalDuration),
+				EvalCount:          data.EvalCount,
+				EvalDuration:       time.Duration(data.EvalDuration),
+			}, nil, nil
+		}()
+
+		if abortErr != nil {
+			return model.Result{}, abortErr
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("bad status: %s", resp.Status)
-			continue
+		if finished {
+			resData.Duration = time.Since(start) // Calculate overall duration for the successful attempt
+			resData.TokensGenerated = resData.EvalCount
+			resData.TokensReturned = len(strings.Split(resData.Response, " "))
+			return resData, nil
 		}
-
-		var data struct {
-			Response           string `json:"response"`
-			Done               bool   `json:"done"`
-			TotalDuration      int64  `json:"total_duration"` // ns
-			LoadDuration       int64  `json:"load_duration"`  // ns
-			PromptEvalCount    int    `json:"prompt_eval_count"`
-			PromptEvalDuration int64  `json:"prompt_eval_duration"` // ns
-			EvalCount          int    `json:"eval_count"`
-			EvalDuration       int64  `json:"eval_duration"` // ns
-		}
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		if err := json.Unmarshal(bodyBytes, &data); err != nil {
-			lastErr = err
-			continue
-		}
-
-		// Calculate metrics
-		res.Duration = time.Since(start)
-
-		res.TotalDuration = time.Duration(data.TotalDuration)
-		res.LoadDuration = time.Duration(data.LoadDuration)
-		res.PromptEvalCount = data.PromptEvalCount
-		res.PromptEvalDuration = time.Duration(data.PromptEvalDuration)
-		res.EvalCount = data.EvalCount
-		res.EvalDuration = time.Duration(data.EvalDuration)
-
-		res.TokensGenerated = data.EvalCount // Use official count
-		res.TokensReturned = len(strings.Split(data.Response, " "))
-		res.Response = data.Response
-
-		return res, nil
+		lastErr = loopErr
 	}
 
 	res.Error = lastErr.Error()

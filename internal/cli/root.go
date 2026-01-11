@@ -48,10 +48,8 @@ var (
 
 	rootCmd = &cobra.Command{
 		Use:   "forest-runner",
-		Short: "A unified Ollama server benchmarking and testing tool",
-		Long: `Forest Runner detects available models on Ollama hosts,
-runs streaming and non-streaming inference tests, and records
-detailed metrics to CSV/JSON.`,
+		Short: "Benchmarking and testing tool for Ollama fleets",
+		Long:  `A systematic auditing tool for Ollama models. Use 'run --help' for benchmark options.`,
 	}
 )
 

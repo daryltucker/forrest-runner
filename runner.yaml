@@ -11,6 +11,12 @@ output_file: "benchmark_results.csv"
 max_retries: 3
 retry_delay: 2s
 stream_timeout: 60s
+load_timeout: 10m  # Time allowed for initial model load into VRAM
+
+# Strict Hardware Guards
+gpu_only: true           # If true, abort if model spills into System RAM (CPU)
+cpu_only_allowed: false  # If false, abort if model loads 100% on CPU
+keep_alive: 0            # "0" (immediate unload), "5m", "1h", etc.
 
 exclude:
   - "embed"

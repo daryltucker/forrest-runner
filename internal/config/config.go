@@ -48,15 +48,21 @@ import (
 
 // Config represents the full configuration for Forest Runner.
 type Config struct {
-	URLs          []string      `yaml:"urls"`
-	Prompt        string        `yaml:"prompt"`
-	OutputDir     string        `yaml:"output_dir"`
-	OutputFile    string        `yaml:"output_file"` // Deprecated? Or just filename? Let's keep for filename base.
-	MaxRetries    int           `yaml:"max_retries"`
-	RetryDelay    time.Duration `yaml:"retry_delay"`
-	StreamTimeout time.Duration `yaml:"stream_timeout"`
+	URLs           []string      `yaml:"urls"`
+	Prompt         string        `yaml:"prompt"`
+	OutputDir      string        `yaml:"output_dir"`
+	OutputFile     string        `yaml:"output_file"` // Deprecated? Or just filename? Let's keep for filename base.
+	MaxRetries     int           `yaml:"max_retries"`
+	RetryDelay     time.Duration `yaml:"retry_delay"`
+	StreamTimeout  time.Duration `yaml:"stream_timeout"`
+	LoadTimeout    time.Duration `yaml:"load_timeout"`
+	KeepAlive      string        `yaml:"keep_alive"` // "0", "5m", etc.
+	CPUOnlyAllowed bool          `yaml:"cpu_only_allowed"`
+	GPUOnly        bool          `yaml:"gpu_only"`
 	// Exclude is a list of strings to filter model names (substring match)
 	Exclude []string `yaml:"exclude"`
+	// Models is an optional list of specific model names to include (overrides discovery)
+	Models []string `yaml:"models"`
 	// InferConfigs allows defining multiple inference configurations
 	InferConfigs []map[string]interface{} `yaml:"inference_configs"`
 }
@@ -64,14 +70,18 @@ type Config struct {
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		URLs:          []string{"http://localhost:11434"},
-		Prompt:        "What is the capital of France?",
-		OutputDir:     ".",
-		OutputFile:    "model_results.csv",
-		MaxRetries:    3,
-		RetryDelay:    2 * time.Second,
-		StreamTimeout: 60 * time.Second,
-		Exclude:       []string{"embed", "rerank"},
+		URLs:           []string{"http://localhost:11434"},
+		Prompt:         "What is the capital of France?",
+		OutputDir:      ".",
+		OutputFile:     "model_results.csv",
+		MaxRetries:     3,
+		RetryDelay:     2 * time.Second,
+		StreamTimeout:  60 * time.Second,
+		LoadTimeout:    10 * time.Minute,
+		KeepAlive:      "10s",
+		CPUOnlyAllowed: false,
+		GPUOnly:        true,
+		Exclude:        []string{"embed", "rerank"},
 		InferConfigs: []map[string]interface{}{
 			{"num_ctx": 2048},
 			{"num_ctx": 4096},

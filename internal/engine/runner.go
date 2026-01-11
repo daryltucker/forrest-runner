@@ -50,6 +50,21 @@ import (
 	"github.com/daryltucker/forest-runner/internal/output"
 )
 
+// nextAvailablePath returns the original path if it doesn't exist,
+// otherwise appends .1, .2, etc. until an available path is found.
+func nextAvailablePath(path string) string {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return path
+	}
+
+	for i := 1; ; i++ {
+		newPath := fmt.Sprintf("%s.%d", path, i)
+		if _, err := os.Stat(newPath); os.IsNotExist(err) {
+			return newPath
+		}
+	}
+}
+
 // Run executes the full benchmark suite.
 func Run(cfg *config.Config) error {
 	e := New(cfg)
@@ -59,15 +74,15 @@ func Run(cfg *config.Config) error {
 		return fmt.Errorf("failed to create output directory %s: %w", cfg.OutputDir, err)
 	}
 
-	// Setup Outputs
-	csvPath := filepath.Join(cfg.OutputDir, cfg.OutputFile)
+	// Setup Outputs with Versioning
+	csvPath := nextAvailablePath(filepath.Join(cfg.OutputDir, cfg.OutputFile))
 	csvWriter, err := output.NewCSVWriter(csvPath)
 	if err != nil {
 		return fmt.Errorf("failed to init CSV writer at %s: %w", csvPath, err)
 	}
 	defer csvWriter.Close()
 
-	jsonPath := filepath.Join(cfg.OutputDir, "model_results.json")
+	jsonPath := nextAvailablePath(filepath.Join(cfg.OutputDir, "model_results.json"))
 	jsonWriter, err := output.NewJSONWriter(jsonPath)
 	if err != nil {
 		return fmt.Errorf("failed to init JSON writer at %s: %w", jsonPath, err)
@@ -77,6 +92,12 @@ func Run(cfg *config.Config) error {
 	// 1. Discovery Phase
 	targets := make(map[string][]string)
 	for _, url := range cfg.URLs {
+		if len(cfg.Models) > 0 {
+			output.Logger.Info("Using explicit model list", "url", url, "count", len(cfg.Models))
+			targets[url] = cfg.Models
+			continue
+		}
+
 		output.Logger.Info("Discovering models...", "url", url)
 		models, err := e.GetModels(url)
 		if err != nil {
@@ -121,17 +142,17 @@ func Run(cfg *config.Config) error {
 
 				res, err := e.Inference(url, modelName, cfg.Prompt, inferCfg)
 				if err != nil {
-					output.Logger.Error("Inference Benchmark Failed", "model", modelName, "config", inferCfg, "error", err)
+					output.Logger.Error("Inference Benchmark Failed. Skipping remaining configs for this model.", "model", modelName, "config", inferCfg, "error", err)
 					// Log failed result with error?
 					res.Error = err.Error()
-					// Write partial result and continue to next config
+					// Write partial result
 					if err := csvWriter.Write(res); err != nil {
 						output.Logger.Error("Failed to write partial result to CSV", "error", err)
 					}
 					if err := jsonWriter.Write(res); err != nil {
 						output.Logger.Error("Failed to write partial result to JSON", "error", err)
 					}
-					continue
+					break // Cruiser Protocol: Don't keep testing if the tree is rotting
 				}
 
 				// Capture VRAM Stats (Model is likely still loaded)
