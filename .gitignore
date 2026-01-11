@@ -1,0 +1,6 @@
+**/.*
+!.gitignore
+!.vectorignore
+results/
+docs/**
+forest-runner

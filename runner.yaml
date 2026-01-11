@@ -1,0 +1,21 @@
+# Forest Runner Configuration (Example)
+urls:
+  #- "https://ollama-003.edge.nugit.net"
+  - "http://localhost:11434"
+
+prompt: "Explain quantum entanglement to a 5-year-old."
+
+output_dir: "."
+output_file: "benchmark_results.csv"
+
+max_retries: 3
+retry_delay: 2s
+stream_timeout: 60s
+
+exclude:
+  - "embed"
+  - "rerank"
+
+inference_configs:
+  - num_ctx: 2048
+  - num_ctx: 4096
