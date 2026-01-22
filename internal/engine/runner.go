@@ -175,6 +175,15 @@ func runForURL(e *Engine, cfg *config.Config, url string, csvWriter *output.CSVW
 			if err != nil {
 				output.Logger.Error("Inference Benchmark Failed. Skipping remaining configs for this model.", "model", modelName, "url", url, "config", inferCfg, "error", err)
 				res.Error = err.Error()
+
+				// Attempt to capture VRAM Stats even on error (robustness)
+				size, vram, vramErr := e.GetRunningModelInfo(url, modelName)
+				if vramErr == nil && size > 0 {
+					res.MemoryUsage = size
+					res.VRAMUsage = vram
+					res.VRAMPercentage = float64(vram) / float64(size) * 100.0
+				}
+
 				// Write partial result
 				if err := csvWriter.Write(res); err != nil {
 					output.Logger.Error("Failed to write partial result to CSV", "error", err)
@@ -191,6 +200,10 @@ func runForURL(e *Engine, cfg *config.Config, url string, csvWriter *output.CSVW
 				res.MemoryUsage = size
 				res.VRAMUsage = vram
 				res.VRAMPercentage = float64(vram) / float64(size) * 100.0
+			}
+
+			if res.TokensGenerated == 0 {
+				output.Logger.Warn("Model returned success but generated 0 tokens. Context limit exceeded?", "model", modelName)
 			}
 
 			output.Logger.Info("Inference Success",

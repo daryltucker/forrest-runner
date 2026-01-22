@@ -32,6 +32,13 @@ go install ./cmd/forest-runner
   --exclude "embed,rerank"
 ```
 
+### Install JQ Analysis Functions
+`forest-runner` comes with specialized JQ scripts for analyzing results. Install them to your local `vecq` configuration for easy access:
+
+```bash
+forest-runner functions install
+```
+
 ### Automated Result Versioning
 Result output is automatically versioned to prevent data-loss (e.g., `model_results.json.1`).
 
@@ -43,6 +50,7 @@ Result output is automatically versioned to prevent data-loss (e.g., `model_resu
 # Forest Runner Configuration (Example)
 urls:
   - "http://localhost:11434"
+  - "http://192.168.1.50:11434"  # Multiple backends supported
 
 prompt: "Explain quantum entanglement to a 5-year-old."
 
@@ -61,7 +69,8 @@ cpu_only_allowed: false  # If false, abort if model loads 100% on CPU
 keep_alive: 0            # "0" (immediate unload), "5m", "1h", etc.
 
 # Backend Concurrency (Fleet Auditing)
-concurrency: 1           # Number of backend URLs to process in parallel
+concurrency: 2           # Number of backend URLs to process in parallel. 
+                         # Set this to the number of URLs for maximum speed.
 
 exclude:
   - "embed"
@@ -82,7 +91,7 @@ Results are saved as **CSV** (for spreadsheets) and **JSON** (for programmatic a
 Use `vecq` to generate a clean table of Virtual Memory (VRAM) and Token Generation Speed:
 
 ```bash
-vecq -s -r -f summary.jq ./results/model_results.json | column -t
+vecq -s -r -q 'forest_summary' ./results/model_results.json | column -t
 ```
 *Output Example:*
 ```text
@@ -90,6 +99,13 @@ Model                  VRAM(MB)  GPU%  Tk/s  Options
 -----                  --------  ----  ----  -------
 Qwen/Qwen2.5-Coder...  720       100   273   {"num_ctx":2048}
 llama3:8b              5120      100   120   {"num_ctx":4096,"temp":0.7}
+```
+
+### Consolidation (Merging Results)
+If you have multiple versioned results (e.g., from repeated runs or multiple backends), you can merge them into a single "best-of" file. This prioritizes the **most recent successes** over failures.
+
+```bash
+vecq -s -t json -q 'forest_merge_results' ./results/model_results.json* > ./results/merged_results.json
 ```
 
 ### Quick Checks
@@ -106,18 +122,65 @@ vecq -s ./results/model_results.json -q '.[] | select(.vram_gpu_pct > 0) | {mode
 ## Finding Errors for Re-Tests
 
 ```bash
-MODELS=$(vecq -s results/model_results.json -f failed_models.jq -r | paste -sd "," -)
+MODELS=$(vecq -s -t json -q 'forest_failed_models' ./results/model_results.json* -r | paste -sd "," -)
 ./forest-runner run --models "$MODELS"
+vecq -r -q 'forest_summary' ./results/merged_results.json | column -t
 ```
 
 > Result output is automatically incremented to prevent data-loss
+
+## Summary Sort/Filtering
+
+You can chain `forest_summary` with other standard `vecq`/`jq` filters to create custom views.
+
+**Examples:**
+
+1.  **Show only errors:**
+    ```bash
+    vecq -s -r -q 'forest_summary | select(.error)' ./results/model_results.json | column -t
+    ```
+
+2.  **Show only successful runs (non-errors):**
+    ```bash
+    vecq -s -r -q 'forest_summary | select(.tokens_generated > 0)' ./results/model_results.json | column -t
+    ```
+
+3.  **Sort by Speed (Tokens/sec) - Fastest first:**
+    ```bash
+    vecq -s -r -q 'sort_by(.eval_count / (.eval_duration/1e9)) | reverse | forest_summary' ./results/model_results.json | column -t
+    ```
+
+4.  **Filter by VRAM (< 8GB):**
+    ```bash
+    vecq -s -r -q 'map(select(.vram_usage_bytes < 8589934592)) | forest_summary' ./results/model_results.json | column -t
+    ```
+
+5.  **Merged Results Compatibility:**
+    `forest_summary` automatically handles both raw streams and merged arrays (flat or nested), so passing `vecq -s` is always safe!
+    ```bash
+    vecq -s -r -q 'forest_summary' ./results/merged_results.json | column -t
+    ```
+
+6.  **Unique Models (Max Context):**
+    Show only one entry per model (the one with the largest `num_ctx`), removing duplicates.
+    ```bash
+    vecq -s -r -q 'flatten(1) | group_by(.model) | map(sort_by(.config.num_ctx | tonumber) | last) | forest_summary' ./results/merged_results.json | column -t
+    ```
+
+## Backend A/B Testing
+
+To compare results across multiple Ollama servers (e.g., `ollama-001` vs `ollama-002`), simply merge their results. `forest_summary` is smart enough to detect multiple backends and will automatically add a **Backend** column and group the results by Model for side-by-side comparison.
+
+```bash
+forest-runner functions install
+vecq -s -t json -q 'forest_merge_results' ./results/model_results.json* > ./results/merged_comparison.json
+vecq -s -r -q 'forest_summary' ./results/merged_results.json | column -t
+```
 
 
 ## Development
 
 **Philosophy**: Config-as-Code, Hermetic Design, Auditability.
-
-**Primary Agent**: [Cruiser](file:///.agent/AGENT_CRUISER.md) (Model Auditor)
 
 ```bash
 go test ./...
@@ -204,4 +267,32 @@ qwen3:4b                   3406.0    100                55.0   map[num_ctx:2048]
 qwen3:4b                   3406.0    100                55.0   map[num_ctx:4096]
 gemma3:4b-it-q8_0          3196.0    54.32037352889163  15.0   map[num_ctx:2048]
 gemma3:4b-it-q8_0          3196.0    54.32037352889163  15.0   map[num_ctx:4096]
+```
+
+
+### The Cycle
+
+```bash
+# Install analysis tools (first-time only)
+forest-runner functions install
+
+# Run fleet audit
+forest-runner run --concurrency 2
+
+# Consolidate results
+vecq -s -t json -q 'forest_merge_results' ./results/model_results.json* > ./results/merged_results.json
+```
+#### Identify failures and re-test only the "stank" models
+```bash
+MODELS=$(vecq -s ./results/merged_results.json -q 'forest_failed_models' -r | paste -sd "," -)
+forest-runner run --models "$MODELS"
+```
+
+```text
+# ---- ollama-001 ---- #
+NAME                                 ID              SIZE     PROCESSOR    CONTEXT    UNTIL              
+deepseek-r1:8b-llama-distill-fp16    859adef8321e    22 GB    100% GPU     4096       9 seconds from now    
+# ---- ollama-002 ---- #
+NAME                                 ID              SIZE     PROCESSOR    CONTEXT    UNTIL              
+deepseek-r1:8b-llama-distill-fp16    859adef8321e    16 GB    100% GPU     4096       9 seconds from now
 ```

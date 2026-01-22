@@ -28,3 +28,6 @@
 !failed_models.jq
 !prompt.md
 !Makefile
+!functions/
+!cmd/
+!internal/
